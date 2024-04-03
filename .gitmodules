@@ -1,0 +1,3 @@
+[submodule "Llama-2-7b"]
+	path = Llama-2-7b
+	url = git@hf.co:meta-llama/Llama-2-7b
