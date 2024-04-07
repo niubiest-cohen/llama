@@ -11,9 +11,11 @@ import fairscale.nn.model_parallel.initialize as fs_init
 import numpy as np
 import torch
 import torch.nn.functional as F
-from fairscale.nn.model_parallel.layers import (ColumnParallelLinear,
-                                                ParallelEmbedding,
-                                                RowParallelLinear)
+from fairscale.nn.model_parallel.layers import (
+    ColumnParallelLinear,
+    ParallelEmbedding,
+    RowParallelLinear,
+)
 from torch import nn
 
 logging.basicConfig(level=logging.DEBUG)
@@ -102,6 +104,8 @@ class RMSNorm(torch.nn.Module):
             torch.Tensor: The output tensor after applying RMSNorm.
 
         """
+        logging.debug("rmsnorm %s * %s", x.shape, self.weight.shape)
+
         output = self._norm(x.float()).type_as(x)
         return output * self.weight
 
@@ -132,6 +136,9 @@ def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
     t = torch.arange(end, device=freqs.device)  # type: ignore
     freqs = torch.outer(t, freqs).float()  # type: ignore
     freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64
+
+    logging.debug("freqs cis is %s", freqs_cis.shape)
+
     return freqs_cis
 
 
