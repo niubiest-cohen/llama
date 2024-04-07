@@ -1,19 +1,48 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # This software may be used and distributed according to the terms of the Llama 2 Community License Agreement.
 
+import logging
 import math
+import os
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
 import fairscale.nn.model_parallel.initialize as fs_init
+import numpy as np
 import torch
 import torch.nn.functional as F
-from fairscale.nn.model_parallel.layers import (
-    ColumnParallelLinear,
-    ParallelEmbedding,
-    RowParallelLinear,
-)
+from fairscale.nn.model_parallel.layers import (ColumnParallelLinear,
+                                                ParallelEmbedding,
+                                                RowParallelLinear)
 from torch import nn
+
+logging.basicConfig(level=logging.DEBUG)
+
+DUMP_TO = "golden"
+DUMP_ATTN = False
+DUMP_LAYERS = False
+
+
+def savetxt(x: torch.Tensor, name_of):
+    assert ".txt" in name_of, f"name should be **.txt"
+
+    if os.path.exists(name_of):
+        raise Exception(f"{name_of} exsits.")
+
+    name_of = os.path.join(DUMP_TO, name_of)
+    np.savetxt(
+        name_of, x.detach().cpu().numpy().astype(np.float16).flatten(), fmt="%10.8f"
+    )
+
+
+def savebin(x: torch.Tensor, name_of):
+    assert ".bin" in name_of, f"name should be **.bin"
+
+    if os.path.exists(name_of):
+        raise Exception(f"{name_of} exsits.")
+
+    name_of = os.path.join(DUMP_TO, name_of)
+    x.detach().cpu().numpy().astype(np.float16).tofile(name_of)
 
 
 @dataclass
@@ -93,10 +122,12 @@ def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
     Returns:
         torch.Tensor: Precomputed frequency tensor with complex exponentials.
 
-    
-        
+
+
 
     """
+    logging.debug("freqs cis dim %s, end %s", dim, end)
+
     freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
     t = torch.arange(end, device=freqs.device)  # type: ignore
     freqs = torch.outer(t, freqs).float()  # type: ignore
@@ -150,7 +181,7 @@ def apply_rotary_emb(
     Returns:
         Tuple[torch.Tensor, torch.Tensor]: Tuple of modified query tensor and key tensor with rotary embeddings.
 
-        
+
 
     """
     xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
@@ -175,6 +206,7 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
 
 class Attention(nn.Module):
     """Multi-head attention module."""
+
     def __init__(self, args: ModelArgs):
         """
         Initialize the Attention module.
@@ -203,6 +235,7 @@ class Attention(nn.Module):
         self.n_local_kv_heads = self.n_kv_heads // model_parallel_size
         self.n_rep = self.n_local_heads // self.n_local_kv_heads
         self.head_dim = args.dim // args.n_heads
+        self.layer_id = 0
 
         self.wq = ColumnParallelLinear(
             args.dim,
@@ -270,8 +303,23 @@ class Attention(nn.Module):
             torch.Tensor: Output tensor after attention.
 
         """
+
+        if DUMP_ATTN:
+            logging.debug("attn x %s ", x.shape)
+
+            layer_prefix = "layer" + str(self.layer_id) + "_"
+            savebin(x, layer_prefix + "attn_x.txt")
+
         bsz, seqlen, _ = x.shape
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
+
+        if DUMP_ATTN:
+            # savebin(self.wk.weight.transpose(0, 1), "attn_kproj_w.bin")
+            # savebin(self.wv.weight.transpose(0, 1), "attn_vproj_w.bin")
+            # savebin(self.wq.weight.transpose(0, 1), "attn_qproj_w.bin")
+            savebin(xq, layer_prefix + "attn_qproj_out.bin")
+            savebin(xk, layer_prefix + "attn_kproj_out.bin")
+            savebin(xv, layer_prefix + "attn_vproj_out.bin")
 
         xq = xq.view(bsz, seqlen, self.n_local_heads, self.head_dim)
         xk = xk.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
@@ -289,12 +337,18 @@ class Attention(nn.Module):
         values = self.cache_v[:bsz, : start_pos + seqlen]
 
         # repeat k/v heads if n_kv_heads < n_heads
-        keys = repeat_kv(keys, self.n_rep)  # (bs, cache_len + seqlen, n_local_heads, head_dim)
-        values = repeat_kv(values, self.n_rep)  # (bs, cache_len + seqlen, n_local_heads, head_dim)
+        keys = repeat_kv(
+            keys, self.n_rep
+        )  # (bs, cache_len + seqlen, n_local_heads, head_dim)
+        values = repeat_kv(
+            values, self.n_rep
+        )  # (bs, cache_len + seqlen, n_local_heads, head_dim)
 
         xq = xq.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
-        keys = keys.transpose(1, 2) # (bs, n_local_heads, cache_len + seqlen, head_dim)
-        values = values.transpose(1, 2) # (bs, n_local_heads, cache_len + seqlen, head_dim)
+        keys = keys.transpose(1, 2)  # (bs, n_local_heads, cache_len + seqlen, head_dim)
+        values = values.transpose(
+            1, 2
+        )  # (bs, n_local_heads, cache_len + seqlen, head_dim)
         scores = torch.matmul(xq, keys.transpose(2, 3)) / math.sqrt(self.head_dim)
         if mask is not None:
             scores = scores + mask  # (bs, n_local_heads, seqlen, cache_len + seqlen)
@@ -345,6 +399,8 @@ class FeedForward(nn.Module):
         )
 
     def forward(self, x):
+        logging.debug("ffn x %s", x.shape)
+
         return self.w2(F.silu(self.w1(x)) * self.w3(x))
 
 
@@ -403,10 +459,13 @@ class TransformerBlock(nn.Module):
             torch.Tensor: Output tensor after applying attention and feedforward layers.
 
         """
-        h = x + self.attention(
-            self.attention_norm(x), start_pos, freqs_cis, mask
-        )
+        logging.debug("encoder x %s", x.shape)
+
+        h = x + self.attention(self.attention_norm(x), start_pos, freqs_cis, mask)
         out = h + self.feed_forward(self.ffn_norm(h))
+
+        logging.debug("encoder out %s", out.shape)
+
         return out
 
 
@@ -448,9 +507,10 @@ class Transformer(nn.Module):
         )
 
         self.freqs_cis = precompute_freqs_cis(
-            # Note that self.params.max_seq_len is multiplied by 2 because the token limit for the Llama 2 generation of models is 4096. 
+            # Note that self.params.max_seq_len is multiplied by 2 because the token limit for the Llama 2 generation of models is 4096.
             # Adding this multiplier instead of using 4096 directly allows for dynamism of token lengths while training or fine-tuning.
-            self.params.dim // self.params.n_heads, self.params.max_seq_len * 2
+            self.params.dim // self.params.n_heads,
+            self.params.max_seq_len * 2,
         )
 
     @torch.inference_mode()
@@ -473,9 +533,7 @@ class Transformer(nn.Module):
 
         mask = None
         if seqlen > 1:
-            mask = torch.full(
-                (seqlen, seqlen), float("-inf"), device=tokens.device
-            )
+            mask = torch.full((seqlen, seqlen), float("-inf"), device=tokens.device)
 
             mask = torch.triu(mask, diagonal=1)
 
@@ -483,13 +541,17 @@ class Transformer(nn.Module):
             # only for the new sequence. Thus, the matrix of scores is of size
             # (seqlen, cache_len + seqlen), and the only masked entries are (i, j) for
             # j > cache_len + i, since row i corresponds to token cache_len + i.
-            mask = torch.hstack([
-                torch.zeros((seqlen, start_pos), device=tokens.device),
-                mask
-            ]).type_as(h)
+            mask = torch.hstack(
+                [torch.zeros((seqlen, start_pos), device=tokens.device), mask]
+            ).type_as(h)
+            logging.debug("mask %s", mask.shape)
 
         for layer in self.layers:
             h = layer(h, start_pos, freqs_cis, mask)
+
+        if DUMP_LAYERS:
+            savebin(h, f"last_linear_in_{start_pos}_{start_pos + seqlen}.bin")
+
         h = self.norm(h)
         output = self.output(h).float()
         return output
